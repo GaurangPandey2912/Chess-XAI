@@ -1,11 +1,11 @@
 import torch
 import shap
 import numpy as np
-from backend.model import ChessEvalNet
-from backend.features import extract_features
+from model import ChessEvalNet  # Remove 'backend.'
+from features import extract_features  
 
 
-MODEL_PATH = "backend/chess_eval_nn.pt"
+MODEL_PATH = "chess_eval_nn.pt"
 
 FEATURE_NAMES = [
     "white_pawns","white_knights","white_bishops","white_rooks","white_queens",
@@ -31,20 +31,30 @@ FEATURE_NAMES = [
 ]
 
 def load_model_and_explainer():
+    # Load training statistics for normalization
+    import pandas as pd
+    df = pd.read_csv("../data/positions.csv")
+    X = df.iloc[:, :-1].values.astype(np.float32)
+    mean = X.mean(axis=0)
+    std = X.std(axis=0) + 1e-6
+    
     model = ChessEvalNet()
     model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
     model.eval()
 
-    # background must match feature size (28)
+    # background must match feature size (28) and be normalized
     background = np.zeros((1, len(FEATURE_NAMES)))
+    background = (background - mean) / std
     explainer = shap.DeepExplainer(model, torch.tensor(background).float())
 
-    return model, explainer
+    return model, explainer, mean, std
 
 
-def explain_position(board, model, explainer):
+def explain_position(board, model, explainer, mean, std):
     features = extract_features(board)
-    x = torch.tensor(features).float().unsqueeze(0)
+    # Apply same normalization as training
+    features_norm = (np.array(features) - mean) / std
+    x = torch.tensor(features_norm).float().unsqueeze(0)
 
     shap_values = explainer.shap_values(x)
     prediction = model(x).item()

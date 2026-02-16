@@ -11,7 +11,7 @@ DATA_PATH = "data/positions.csv"
 BATCH_SIZE = 64
 EPOCHS = 40
 LR = 5e-4
-MODEL_PATH = "backend/chess_eval_nn.pt"
+MODEL_PATH = "chess_eval_nn.pt"
 
 # --------------------
 # Dataset
