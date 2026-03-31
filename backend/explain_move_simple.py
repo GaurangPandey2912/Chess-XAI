@@ -1,9 +1,18 @@
+import os
 import chess
 import chess.engine
+import shap
+import numpy as np
+import pandas as pd
+import torch
 from features import extract_features
+from model import ChessEvalNet
 
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_DIR = os.path.dirname(BACKEND_DIR)
 ENGINE_PATH = "/Users/gaurangpandey/stockfish/stockfish"
-engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+MODEL_PATH = os.path.join(BACKEND_DIR, "chess_eval_nn.pt")
+DATA_PATH = os.path.join(PROJECT_DIR, "data", "positions.csv")
 
 SQUARE_NAMES = ["a8","b8","c8","d8","e8","f8","g8","h8",
                 "a7","b7","c7","d7","e7","f7","g7","h7",
@@ -21,8 +30,175 @@ CENTER_SQUARES = [chess.E4, chess.D4, chess.E5, chess.D5]
 EXTENDED_CENTER = [chess.C3, chess.D3, chess.E3, chess.F3, chess.C4, chess.D4, chess.E4, chess.F4,
                    chess.C5, chess.D5, chess.E5, chess.F5, chess.C6, chess.D6, chess.E6, chess.F6]
 
+FEATURE_NAMES = [
+    "white_pawns", "white_knights", "white_bishops", "white_rooks", "white_queens",
+    "black_pawns", "black_knights", "black_bishops", "black_rooks", "black_queens",
+    "white_king_safety", "black_king_safety",
+    "white_center_control", "black_center_control",
+    "white_mobility", "black_mobility",
+    "white_isolated_pawns", "black_isolated_pawns",
+    "white_passed_pawns", "black_passed_pawns",
+    "white_doubled_pawns", "black_doubled_pawns",
+    "white_space", "black_space",
+    "minor_piece_diff", "rook_diff", "queen_diff",
+    "white_turn"
+]
+
+engine = chess.engine.SimpleEngine.popen_uci(ENGINE_PATH)
+
+_model = None
+_explainer = None
+_mean = None
+_std = None
+
+
+def _load_xai_components():
+    global _model, _explainer, _mean, _std
+    if _model is not None:
+        return _model, _explainer, _mean, _std
+    
+    df = pd.read_csv(DATA_PATH)
+    X = df.iloc[:, :-1].values.astype(np.float32)
+    _mean = X.mean(axis=0)
+    _std = X.std(axis=0) + 1e-6
+    
+    _model = ChessEvalNet()
+    _model.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
+    _model.eval()
+    
+    background = np.zeros((1, len(FEATURE_NAMES)))
+    background_norm = (background - _mean) / _std
+    background_tensor = torch.tensor(background_norm).float()
+    _explainer = shap.DeepExplainer(_model, background_tensor)
+    
+    return _model, _explainer, _mean, _std
+
+
+def _get_shap_explanation(board):
+    model, explainer, mean, std = _load_xai_components()
+    
+    features = extract_features(board)
+    features_norm = (np.array(features) - mean) / std
+    x = torch.tensor(features_norm).float().unsqueeze(0)
+    
+    shap_values = explainer.shap_values(x)
+    prediction = model(x).item()
+    
+    return shap_values[0], prediction, features
+
+
+def _interpret_shap_features(shap_vals, features, feature_names, top_k=8):
+    pairs = sorted(zip(feature_names, shap_vals), key=lambda x: abs(x[1]), reverse=True)
+    
+    explanations = []
+    
+    material_idx = {
+        "white_pawns": 0, "white_knights": 1, "white_bishops": 2, "white_rooks": 3, "white_queens": 4,
+        "black_pawns": 5, "black_knights": 6, "black_bishops": 7, "black_rooks": 8, "black_queens": 9
+    }
+    
+    white_material = sum(features[i] * [1, 3, 3, 5, 9][i] for i in range(5))
+    black_material = sum(features[i] * [1, 3, 3, 5, 9][i - 5 if i >= 5 else 0] for i in range(5, 10))
+    white_material = sum(features[i] * v for i, v in enumerate([1, 3, 3, 5, 9]))
+    black_material = sum(features[5 + i] * v for i, v in enumerate([1, 3, 3, 5, 9]))
+    material_diff = white_material - black_material
+    
+    for name, val in pairs[:top_k]:
+        if abs(val) < 0.1:
+            continue
+            
+        if name == "white_king_safety":
+            if val > 0.2:
+                explanations.append(f"  - White's king position is safe (safety: {features[10]:.0f})")
+            elif val < -0.2:
+                explanations.append(f"  - White's king safety is compromised (safety: {features[10]:.0f})")
+                
+        elif name == "black_king_safety":
+            if val > 0.2:
+                explanations.append(f"  - Black's king position is safe (safety: {features[11]:.0f})")
+            elif val < -0.2:
+                explanations.append(f"  - Black's king safety is compromised (safety: {features[11]:.0f})")
+                
+        elif name == "white_center_control":
+            if val > 0.2:
+                explanations.append(f"  - White controls the center ({features[12]:.0f} squares)")
+            elif val < -0.2:
+                explanations.append(f"  - Black dominates center control ({features[13]:.0f} squares)")
+                
+        elif name == "black_center_control":
+            if val > 0.2:
+                explanations.append(f"  - Black controls the center ({features[13]:.0f} squares)")
+            elif val < -0.2:
+                explanations.append(f"  - White dominates center control ({features[12]:.0f} squares)")
+                
+        elif name == "white_mobility":
+            if val > 0.2:
+                explanations.append(f"  - White has active pieces ({features[14]:.0f} legal moves)")
+            elif val < -0.2:
+                explanations.append(f"  - Black has more active pieces ({features[15]:.0f} moves)")
+                
+        elif name == "black_mobility":
+            if val > 0.2:
+                explanations.append(f"  - Black has active pieces ({features[15]:.0f} legal moves)")
+            elif val < -0.2:
+                explanations.append(f"  - White has more active pieces ({features[14]:.0f} moves)")
+                
+        elif name == "white_passed_pawns":
+            if val > 0.15 and features[18] > 0:
+                explanations.append(f"  - White has passed pawns threatening promotion")
+                
+        elif name == "black_passed_pawns":
+            if val > 0.15 and features[19] > 0:
+                explanations.append(f"  - Black has passed pawns threatening promotion")
+                
+        elif name == "white_space":
+            if val > 0.15:
+                explanations.append(f"  - White controls more board space ({features[24]:.0f} squares)")
+            elif val < -0.15:
+                explanations.append(f"  - Black controls more board space ({features[25]:.0f} squares)")
+                
+        elif name == "minor_piece_diff":
+            if val > 0.2:
+                explanations.append(f"  - White has better minor piece coordination")
+            elif val < -0.2:
+                explanations.append(f"  - Black has better minor piece coordination")
+                
+        elif name == "rook_diff":
+            if val > 0.2:
+                explanations.append(f"  - White has rook activity advantage")
+            elif val < -0.2:
+                explanations.append(f"  - Black has rook activity advantage")
+                
+        elif name == "queen_diff":
+            if val > 0.2:
+                explanations.append(f"  - White's queen is better positioned")
+            elif val < -0.2:
+                explanations.append(f"  - Black's queen is better positioned")
+                
+        elif name in material_idx:
+            idx = material_idx[name]
+            if "white" in name:
+                piece = name.replace("white_", "")
+                if val > 0.3 and features[idx] > 0:
+                    explanations.append(f"  - White has {features[idx]:.0f} {piece} on the board")
+            elif "black" in name:
+                piece = name.replace("black_", "")
+                if val > 0.3 and features[idx] > 0:
+                    explanations.append(f"  - Black has {features[idx]:.0f} {piece} on the board")
+    
+    if material_diff > 2:
+        explanations.insert(0, f"  - Material: White leads by {material_diff:.1f} points")
+    elif material_diff < -2:
+        explanations.insert(0, f"  - Material: Black leads by {-material_diff:.1f} points")
+    elif abs(material_diff) < 0.5:
+        explanations.insert(0, f"  - Material is equal")
+    
+    return explanations[:top_k]
+
+
 def square_to_name(sq):
     return SQUARE_NAMES[sq]
+
 
 def get_stockfish_evaluation(board, depth=15):
     info = engine.analyse(board, chess.engine.Limit(depth=depth))
@@ -31,94 +207,8 @@ def get_stockfish_evaluation(board, depth=15):
         return 0.0
     return score / 100.0
 
-def analyze_position_features(board):
-    """Analyze position features for basic insights without SHAP."""
-    features = extract_features(board)
-    feature_names = [
-        "white_pawns","white_knights","white_bishops","white_rooks","white_queens",
-        "black_pawns","black_knights","black_bishops","black_rooks","black_queens",
-        "white_king_safety","black_king_safety",
-        "white_center_control","black_center_control",
-        "white_mobility","black_mobility",
-        "white_isolated_pawns","black_isolated_pawns",
-        "white_passed_pawns","black_passed_pawns",
-        "white_doubled_pawns","black_doubled_pawns",
-        "white_space","black_space",
-        "minor_piece_diff","rook_diff","queen_diff",
-        "white_turn"
-    ]
-    
-    insights = []
-    
-    # Material analysis
-    white_material = features[0] + 3*features[1] + 3*features[2] + 5*features[3] + 9*features[4]
-    black_material = features[5] + 3*features[6] + 3*features[7] + 5*features[8] + 9*features[9]
-    material_diff = white_material - black_material
-    
-    if material_diff > 3:
-        insights.append("White has significant material advantage")
-    elif material_diff < -3:
-        insights.append("Black has significant material advantage")
-    elif abs(material_diff) > 0:
-        insights.append(f"{'White' if material_diff > 0 else 'Black'} leads by {abs(material_diff):.1f} points")
-    else:
-        insights.append("Material is equal")
-    
-    # Add specific material advantages
-    if features[1] > features[6] + 0:
-        insights.append(f"White leads {features[1]-features[6]:.0f} knights")
-    elif features[6] > features[1] + 0:
-        insights.append(f"Black leads {features[6]-features[1]:.0f} knights")
-    
-    if features[3] > features[8] + 0:
-        insights.append(f"White leads {features[3]-features[8]:.0f} rooks")
-    elif features[8] > features[3] + 0:
-        insights.append(f"Black leads {features[8]-features[3]:.0f} rooks")
-    
-    if features[2] > features[7] + 0:
-        insights.append(f"White leads {features[2]-features[7]:.0f} bishops")
-    elif features[7] > features[2] + 0:
-        insights.append(f"Black leads {features[7]-features[2]:.0f} bishops")
-    
-    if features[4] > features[9] + 0:
-        insights.append(f"White leads {features[4]-features[9]:.0f} queens")
-    elif features[9] > features[4] + 0:
-        insights.append(f"Black leads {features[9]-features[4]:.0f} queens")
-    
-    # King safety
-    if features[10] > 80:  # white king safety
-        insights.append("White's king position is very safe")
-    elif features[11] > 80:  # black king safety
-        insights.append("Black's king position is very safe")
-    elif features[10] < 50:
-        insights.append("White's king safety is compromised")
-    elif features[11] < 50:
-        insights.append("Black's king safety is compromised")
-    
-    # Center control
-    if features[12] > features[13] + 2:
-        insights.append("White dominates the center")
-    elif features[13] > features[12] + 2:
-        insights.append("Black dominates the center")
-    elif abs(features[12] - features[13]) <= 1:
-        insights.append("Center control is balanced")
-    
-    # Mobility
-    if features[14] > features[15] + 5:
-        insights.append("White has much more active pieces")
-    elif features[15] > features[14] + 5:
-        insights.append("Black has much more active pieces")
-    
-    # Pawn structure
-    if features[18] > features[19]:  # white passed pawns vs black
-        insights.append("White has dangerous passed pawns")
-    elif features[19] > features[18]:
-        insights.append("Black has dangerous passed pawns")
-    
-    return insights
 
 def analyze_move_reasoning(board, move):
-    """Analyze why a move is good with specific details."""
     reasons = []
     
     is_white = board.turn
@@ -134,67 +224,36 @@ def analyze_move_reasoning(board, move):
     
     if temp_board.is_check():
         if temp_board.is_checkmate():
-            reasons.append(f"🎯 Checkmate! Forces {opponent} to resign")
+            reasons.append(f"Checkmate! Forces {opponent} to resign")
         elif temp_board.is_stalemate():
-            reasons.append(f"🎯 Stalemate trap - {opponent} has no legal moves")
+            reasons.append(f"Stalemate trap - {opponent} has no legal moves")
         else:
-            reasons.append(f"🎯 Check on {opponent}'s king at {square_to_name(temp_board.king(not is_white))}")
+            reasons.append(f"Check on {opponent}'s king at {square_to_name(temp_board.king(not is_white))}")
     
     if board.is_capture(move):
         captured = board.piece_at(move.to_square)
         if captured:
             captured_name = PIECE_SYMBOLS.get(captured.piece_type, "piece")
-            move_captured = f"{piece_name} from {from_sq} captures {captured_name} on {to_sq}"
-            
             piece_values = {"pawn": 1, "knight": 3, "bishop": 3, "rook": 5, "queen": 9, "king": 100}
             our_val = piece_values.get(piece_name, 0)
             their_val = piece_values.get(captured_name, 0)
             
+            trade_desc = f"{piece_name} from {from_sq} captures {captured_name} on {to_sq}"
             if their_val > our_val:
-                move_captured += f" (winning trade: +{their_val - our_val:.0f})"
+                trade_desc += f" (winning trade: +{their_val - our_val:.0f})"
             elif their_val == our_val:
-                move_captured += " (equal trade)"
+                trade_desc += " (equal trade)"
             else:
-                move_captured += f" (losing trade: {their_val - our_val:.0f})"
+                trade_desc += f" (losing trade: {their_val - our_val:.0f})"
             
-            reasons.append(f"⚔️ {move_captured}")
+            reasons.append(trade_desc)
     
     if move.promotion:
-        reasons.append(f"👑 Pawn promotes to {PIECE_SYMBOLS.get(move.promotion, 'queen')} on {to_sq}")
+        reasons.append(f"Pawn promotes to {PIECE_SYMBOLS.get(move.promotion, 'queen')} on {to_sq}")
     
     if board.is_en_passant(move):
         ep_square = square_to_name(move.to_square + (-8 if is_white else 8))
-        reasons.append(f"⚔️ En passant: captures pawn on {ep_square}")
-    
-    attacking_squares = []
-    for sq in [s for s in chess.SQUARES if temp_board.is_attacked_by(is_white, s)]:
-        if temp_board.piece_at(sq) and temp_board.piece_at(sq).color == is_white:
-            sq_name = square_to_name(sq)
-            attacked = temp_board.attackers(not is_white, sq)
-            for attacker in attacked:
-                if temp_board.piece_at(attacker):
-                    attacker_piece = temp_board.piece_at(attacker)
-                    if attacker_piece.color == is_white:
-                        attacking_squares.append((sq_name, PIECE_SYMBOLS.get(attacker_piece.piece_type, "piece")))
-    
-    if len(attacking_squares) > 1:
-        squares = [s[0] for s in attacking_squares[:3]]
-        pieces = [s[1] for s in attacking_squares[:3]]
-        reasons.append(f"⚠️ Double attack on {', '.join(squares)} - opponent must respond to one threat")
-    
-    features = extract_features(temp_board)
-    if is_white:
-        opp_king_safety = features[11]
-        player_king_safety = features[10]
-    else:
-        opp_king_safety = features[10]
-        player_king_safety = features[11]
-    
-    opp_king_sq = square_to_name(temp_board.king(not is_white))
-    if opp_king_safety < 50:
-        reasons.append(f"👑 {opponent}'s king at {opp_king_sq} is exposed and vulnerable (safety: {opp_king_safety:.0f})")
-    elif opp_king_safety < 70:
-        reasons.append(f"🛡️ {opponent}'s king at {opp_king_sq} has developing weaknesses")
+        reasons.append(f"En passant: captures pawn on {ep_square}")
     
     controlled_squares = []
     for sq in CENTER_SQUARES + EXTENDED_CENTER:
@@ -202,50 +261,18 @@ def analyze_move_reasoning(board, move):
             controlled_squares.append(square_to_name(sq))
     
     if len(controlled_squares) >= 4:
-        reasons.append(f"🎯 Strong center control: occupies {', '.join(controlled_squares[:4])}")
-    elif controlled_squares:
-        reasons.append(f"🎯 Controls {len(controlled_squares)} central squares: {', '.join(controlled_squares[:3])}")
-    
-    if is_white:
-        player_center = features[12]
-        opp_center = features[13]
-        player_passed = features[18]
-        opp_passed = features[19]
-        player_mobility = features[14]
-        opp_mobility = features[15]
-    else:
-        player_center = features[13]
-        opp_center = features[12]
-        player_passed = features[19]
-        opp_passed = features[18]
-        player_mobility = features[15]
-        opp_mobility = features[14]
-    
-    if player_passed > opp_passed + 0.5:
-        reasons.append(f"♟️ Advanced passed pawn threatens promotion on {['h','g','f','e','d','c','b','a'][7 if is_white else 0]}-file")
-    elif opp_passed > player_passed + 0.5:
-        reasons.append(f"⚠️ Opponent's passed pawn on {['h','g','f','e','d','c','b','a'][7 if not is_white else 0]}-file requires immediate attention")
-    
-    if player_mobility > opp_mobility + 5:
-        reasons.append(f"🐴 Superior piece activity: {player_mobility:.0f} vs {opp_mobility:.0f} legal moves")
-    elif opp_mobility > player_mobility + 5:
-        reasons.append(f"⚠️ Opponent has more active pieces: {opp_mobility:.0f} vs {player_mobility:.0f} moves")
-    
-    legal_moves = list(temp_board.legal_moves)
-    capture_moves = [m for m in legal_moves if temp_board.is_capture(m)]
-    if len(capture_moves) >= 3 and len(legal_moves) > 0:
-        capture_ratio = len(capture_moves) / len(legal_moves) * 100
-        reasons.append(f"💥 Tactic opportunity: {len(capture_moves)} of {len(legal_moves)} available moves are captures")
+        reasons.append(f"Strong center control: occupies {', '.join(controlled_squares[:4])}")
     
     if temp_board.has_kingside_castling_rights(is_white):
-        reasons.append(f"🏰 Kingside castling still available")
+        reasons.append("Kingside castling still available")
     if temp_board.has_queenside_castling_rights(is_white):
-        reasons.append(f"🏰 Queenside castling still available")
+        reasons.append("Queenside castling still available")
     
     return reasons
 
+
 def explain_best_move(fen):
-    """Provide detailed chess move explanations with specific square names and tactical patterns."""
+    """Provide SHAP-based explainable AI chess move explanations."""
     board = chess.Board(fen)
     
     current_player = "White" if board.turn else "Black"
@@ -267,7 +294,11 @@ def explain_best_move(fen):
     board.push(best_move)
     eval_after = get_stockfish_evaluation(board, depth=12)
     
-    features = extract_features(board)
+    shap_vals, nn_pred, features = _get_shap_explanation(board)
+    if shap_vals.ndim > 1:
+        shap_vals = shap_vals.flatten()
+    shap_explanations = _interpret_shap_features(shap_vals, features, FEATURE_NAMES)
+    
     white_king_sq = square_to_name(board.king(True))
     black_king_sq = square_to_name(board.king(False))
     
@@ -291,59 +322,47 @@ def explain_best_move(fen):
     
     eval_change = eval_after - eval_before
     
-    move_explanation = f"""🎯 Best Move: {piece_name.capitalize()} {from_sq}-{to_sq} ({best_move_san})
+    move_explanation = f"""Best Move: {piece_name.capitalize()} {from_sq}-{to_sq} ({best_move_san})
 
-📊 Position Evaluation:
+Position Evaluation (Stockfish depth 15):
    Before: {format_eval(eval_before)}
    After:  {format_eval(eval_after)}
    Change: {'+' if eval_change > 0 else ''}{eval_change:.2f} pawns
 
-⭐ Why {best_move_san}?
+Neural Network Prediction: {nn_pred:+.2f} (based on learned position patterns)
+
+Why {best_move_san}?
 """
     
     if move_reasons:
         for reason in move_reasons:
-            move_explanation += f"   {reason}\n"
+            move_explanation += f"   - {reason}\n"
     else:
-        move_explanation += f"   • Develops {piece_name} to active square {to_sq}\n"
-        move_explanation += f"   • Maintains tactical flexibility\n"
+        move_explanation += f"   - Develops {piece_name} to active square {to_sq}\n"
+        move_explanation += f"   - Maintains tactical flexibility\n"
     
     move_explanation += f"""
-🔍 Position Details:
+SHAP Feature Attribution Analysis:
+   The neural network's evaluation is explained by:
+"""
+    
+    for exp in shap_explanations:
+        move_explanation += f"   {exp}\n"
+    
+    move_explanation += f"""
+Position Details:
    White King: {white_king_sq}
    Black King: {black_king_sq}
-   White Material: {features[0]:.0f}p + {features[1]:.0f}N + {features[2]:.0f}B + {features[3]:.0f}R + {features[4]:.0f}Q
-   Black Material: {features[5]:.0f}p + {features[6]:.0f}N + {features[7]:.0f}B + {features[8]:.0f}R + {features[9]:.0f}Q
+   Material: White {features[0]:.0f}p+{features[1]:.0f}N+{features[2]:.0f}B+{features[3]:.0f}R+{features[4]:.0f}Q
+              Black {features[5]:.0f}p+{features[6]:.0f}N+{features[7]:.0f}B+{features[8]:.0f}R+{features[9]:.0f}Q
    Center Control: White {features[12]:.0f} vs Black {features[13]:.0f}
    Piece Activity: White {features[14]:.0f} vs Black {features[15]:.0f} legal moves
-   
-💡 Key Insights:"""
-    
-    if features[12] > features[13] + 2:
-        move_explanation += f"\n   • White controls key central squares (d4, e4, d5, e5)"
-    elif features[13] > features[12] + 2:
-        move_explanation += f"\n   • Black dominates the center"
-    
-    white_has_passed = features[18] > 0
-    black_has_passed = features[19] > 0
-    if white_has_passed and not black_has_passed:
-        move_explanation += f"\n   • White has passed pawn(s) that can advance toward promotion"
-    elif black_has_passed and not white_has_passed:
-        move_explanation += f"\n   • Black has dangerous passed pawn threatening promotion"
-    
-    if is_white:
-        if features[10] < 50:
-            move_explanation += f"\n   • Your king at {white_king_sq} is exposed - consider castling or evacuating"
-        if features[11] < 50:
-            move_explanation += f"\n   • {opponent}'s king at {black_king_sq} is vulnerable to attack"
-    else:
-        if features[11] < 50:
-            move_explanation += f"\n   • Your king at {black_king_sq} is exposed - consider castling or evacuating"
-        if features[10] < 50:
-            move_explanation += f"\n   • {opponent}'s king at {white_king_sq} is vulnerable to attack"
-    
-    move_explanation += f"""
-   
-💡 Technical: Stockfish depth 15 | 1 pawn = 1.0 evaluation"""
+
+Technical Details:
+   - Stockfish evaluation: depth 15 search
+   - SHAP DeepExplainer: neural network feature attribution
+   - 1 pawn = 1.0 evaluation points
+   - Positive SHAP values favor White, negative favor Black
+"""
     
     return move_explanation
