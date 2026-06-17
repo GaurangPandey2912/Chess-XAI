@@ -1,80 +1,79 @@
-import { useState } from "react";
-import { Chess } from "chess.js";
-import { Chessboard } from "react-chessboard";
-import axios from "axios";
+import useChessGame from "./hooks/useChessGame";
+import ChessBoardSection from "./components/ChessBoard";
+import MoveHistory from "./components/MoveHistory";
+import AnalysisPanel from "./components/AnalysisPanel";
+import "./App.css";
 
-function App() {
-  const [game, setGame] = useState(new Chess());
-  const [explanation, setExplanation] = useState("");
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
+export default function App() {
+  const {
+    fen,
+    history,
+    analysis,
+    isAnalyzing,
+    error,
+    orientation,
+    gameOver,
+    showBestMove,
+    makeMove,
+    undoMove,
+    resetGame,
+    flipBoard,
+    analyzePosition,
+    toggleBestMove,
+  } = useChessGame();
 
-  const makeAMove = (move) => {
-    const gameCopy = new Chess(game.fen());
-    const result = gameCopy.move(move);
-    setGame(gameCopy);
-    return result;
-  };
-
-  const analyzePosition = async () => {
-    setIsAnalyzing(true);
-    try {
-      const fen = game.fen();
-      console.log("Analyzing position with FEN:", fen);
-      const res = await axios.get("http://127.0.0.1:8000/explain_move", {
-        params: { fen: fen },
-      });
-      console.log("API response:", res.data);
-      if (res.data.error) {
-        setExplanation(`Error: ${res.data.error}`);
-      } else {
-        setExplanation(res.data.result);
-      }
-    } catch (e) {
-      console.error("API Error:", e);
-      setExplanation("Error getting AI explanation. Check if backend is running.");
-    }
-    setIsAnalyzing(false);
-  };
-
-  const onPieceDrop = (sourceSquare, targetSquare) => {
-    const move = makeAMove({
-      from: sourceSquare,
-      to: targetSquare,
-      promotion: "q",
-    });
-
-    if (move === null) return false;
-
+  const onPieceDrop = (source, target) => {
+    if (gameOver) return false;
+    const move = makeMove(source, target);
+    if (!move) return false;
     analyzePosition();
-
     return true;
   };
 
   return (
-    <div style={{ padding: "20px" }}>
-      <h1>Chess AI Coach</h1>
-      <div style={{ display: "flex", gap: "20px", alignItems: "flex-start" }}>
-        <div>
-          <Chessboard 
-            position={game.fen()} 
-            onPieceDrop={onPieceDrop} 
-            boardWidth={400}
+    <div className="app">
+      <header className="app-header">
+        <div className="header-left">
+          <div className="logo">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 2a10 10 0 1 0 10 10h-10V2z" />
+              <path d="M12 12 8 8" />
+              <path d="M16 16 12 12" />
+            </svg>
+          </div>
+          <h1>Chess AI Coach</h1>
+        </div>
+        <div className="header-right">
+          <span className="status-dot" />
+          <span className="status-text">AI-Powered Analysis</span>
+        </div>
+      </header>
+
+      <main className="app-main">
+        <div className="board-column">
+          <ChessBoardSection
+            fen={fen}
+            orientation={orientation}
+            onPieceDrop={onPieceDrop}
+            analysis={analysis}
+            isAnalyzing={isAnalyzing}
+            error={error}
+            gameOver={gameOver}
+            onNewGame={resetGame}
+            onUndo={undoMove}
+            onFlip={flipBoard}
+            onAnalyze={analyzePosition}
+            history={history}
+            showBestMove={showBestMove}
+            onToggleBestMove={toggleBestMove}
           />
-          <button 
-            onClick={analyzePosition}
-            disabled={isAnalyzing}
-            style={{ marginTop: "10px", padding: "10px 20px", fontSize: "14px" }}
-          >
-            {isAnalyzing ? "Analyzing..." : "Analyze Current Position"}
-          </button>
         </div>
-        <div style={{ width: "400px", whiteSpace: "pre-wrap" }}>
-          <h2>AI Coach Explanation</h2>
-          {explanation || "Make a move or click 'Analyze' to get an explanation..."}
+
+        <div className="sidebar-column">
+          <MoveHistory history={history} />
+          <AnalysisPanel analysis={analysis} isAnalyzing={isAnalyzing} error={error} />
         </div>
-      </div>
+      </main>
     </div>
   );
 }
-
-export default App;
